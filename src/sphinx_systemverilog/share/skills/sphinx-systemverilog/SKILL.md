@@ -49,7 +49,7 @@ Checklist, in order:
 4. **Install Graphviz** (`dot` on `PATH`) only if you want diagrams. Without
    it, builds still pass; diagrams are skipped with a warning.
 
-Full list of the 19 `sv_*` values: `references/config.md`.
+Full list of the 22 `sv_*` values: `references/config.md`.
 
 ## Choosing a directive
 
@@ -154,10 +154,10 @@ needed to make a banner-comment list render.
 
 1. **`sv_build_units` for anything configurable.** See the checklist above. A
    wrong choice here produces a doc set that looks complete and is not.
-2. **Structural and UVM views cost; declarations do not.** Nothing walks a
-   hierarchy or a `build_phase` unless a directive on some page asks for it.
-   Asking once per build is free thereafter; asking in `sv_default_options` is
-   a project-wide decision.
+2. **Structural and UVM views cost, once per source change.** The hierarchy
+   and the default testbench tree are walked when the design database is
+   built (cached in `<doctreedir>/svdb/`); a build of unchanged sources walks
+   nothing. Bound the walk with `sv_structure_tops` and the `*_max_*` limits.
 3. **Two kinds of unresolved reference.** An explicit **typed** role
    (`` :sv:class:`x` ``) that resolves to nothing **warns** — fix or qualify
    it. A reference *inferred* from a signature type, a NaturalDocs `<x>` or a
@@ -192,7 +192,7 @@ repository does it in `scripts/check-docs-coverage.py`).
 | File | Covers |
 |---|---|
 | `references/directives.md` | Every directive, argument and option: `auto*`, `autosvsummary` scoping, the 15 `sv:` object directives, structure, diagrams, UVM, roles, doc fields. |
-| `references/config.md` | All 19 `sv_*` config values with defaults, plus the Sphinx settings that interact with this domain. |
+| `references/config.md` | All 22 `sv_*` config values with defaults, plus the Sphinx settings that interact with this domain. |
 | `references/comment-styles.md` | `native`, `naturaldocs`, `doxygen` and `auto`, with rules and examples. |
 | `references/uvm.md` | The six UVM views in depth: node states, black-boxing, orphan pairing, tiers, sequence notation, factory overrides. |
 | `references/troubleshooting.md` | Build symptom → cause → fix. |

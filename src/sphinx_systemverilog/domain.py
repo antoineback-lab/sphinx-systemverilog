@@ -106,8 +106,7 @@ class SvObjectDescription(ObjectDescription):
         qualifiers = self.options.get("qualifiers", "")
         # ``virtual`` is a flag option, so docutils stores None when it is
         # *present*; test for membership, not truthiness.
-        if "virtual" in self.options:
-            qualifiers = ("virtual " + qualifiers).strip()
+        qualifiers = _ordered_qualifiers(qualifiers, "virtual" in self.options)
 
         name = _signature_name(sig, self.object_kind)
         # Stash the resolved name for the TOC hooks: Sphinx calls
@@ -136,6 +135,12 @@ class SvObjectDescription(ObjectDescription):
                 # Dimensions bind to the name; anything else is set off by a space.
                 sep = "" if tail.startswith("[") else " "
                 signode += addnodes.desc_annotation(sep + tail, sep + tail)
+        elif self.object_kind == "class":
+            # 'name #(type T = bit)': the parameter list follows the name.
+            signode += addnodes.desc_name(name, name)
+            params = sig.strip()[len(name):].strip()
+            if params:
+                signode += addnodes.desc_annotation(" " + params, " " + params)
         elif self.object_kind == "macro":
             # The `define keyword is dropped: the kind label already says it,
             # and what a reader needs is the name, its formals, and the body.
@@ -343,45 +348,53 @@ class SystemVerilogDomain(Domain):
 
     def note_object(self, fullname: str, kind: str, anchor: str, docname: str) -> None:
         self.objects[fullname] = (docname, anchor, kind)
+        self._leaves = None
 
     def clear_doc(self, docname: str) -> None:
         for fullname, (dn, _anchor, _kind) in list(self.objects.items()):
             if dn == docname:
                 del self.objects[fullname]
+        self._leaves = None
 
     def merge_domaindata(self, docnames: Iterable[str], otherdata: dict) -> None:
         for fullname, data in otherdata.get("objects", {}).items():
             if data[0] in docnames:
                 self.objects[fullname] = data
+        self._leaves = None
+
+    #: Documented names by their last segment, built on first lookup after a
+    #: change: a bare-name reference costs one dict lookup, not a pass over
+    #: every documented object (plan D2-IMPL-5).  Not domain data, so it is
+    #: neither pickled nor merged.
+    _leaves: dict[str, list[str]] | None = None
+
+    def _by_leaf(self, leaf: str) -> list[str]:
+        if self._leaves is None:
+            leaves: dict[str, list[str]] = {}
+            for fn in self.objects:
+                leaves.setdefault(fn.rsplit("::", 1)[-1], []).append(fn)
+            self._leaves = leaves
+        return self._leaves.get(leaf, [])
 
     def resolve_xref(
         self, env, fromdocname, builder, typ, target, node, contnode
     ):
         match = self._find(target)
         if match is None:
-            # The generic ``obj`` role is also what NaturalDocs ``<xref>`` spans
-            # are converted to; those are inferred, not author-written, so they
-            # degrade silently to text.  Explicit typed roles warn.
-            if typ != "obj":
-                candidates = self.candidates(target)
-                detail = ""
-                if candidates:
-                    detail = " (ambiguous; candidates: %s)" % ", ".join(
-                        sorted(candidates)
-                    )
-                logger.warning(
-                    "sphinx-systemverilog: cannot resolve sv:%s reference %r%s",
-                    typ, target, detail, type="systemverilog",
-                    location=node,
-                )
-            return None
+            # Then a ``role: external`` database.  Intersphinx and
+            # ``sv_external_docs`` follow through ``missing-reference``, where
+            # an explicit typed role still unresolved warns (linkout.py); the
+            # generic ``obj`` role (inferred references) degrades to text.
+            from .linkout import database_ref
+
+            return database_ref(env.app, target, contnode)
         fullname, (docname, anchor, _kind) = match
         return make_refnode(builder, fromdocname, docname, anchor, contnode, fullname)
 
     def candidates(self, target: str) -> list[str]:
         """Fully-qualified names whose final segment matches *target*."""
         leaf = target.replace(".", "::").split("::")[-1]
-        return [fn for fn in self.objects if fn.split("::")[-1] == leaf]
+        return list(self._by_leaf(leaf))
 
     def resolve_any_xref(
         self, env, fromdocname, builder, target, node, contnode
@@ -403,7 +416,8 @@ class SystemVerilogDomain(Domain):
             return alt, self.objects[alt]
         # Bare-name fallback: unique suffix match.
         suffix = "::" + target
-        hits = [fn for fn in self.objects if fn == target or fn.endswith(suffix)]
+        hits = [fn for fn in self._by_leaf(target.split("::")[-1])
+                if fn == target or fn.endswith(suffix)]
         if len(hits) == 1:
             return hits[0], self.objects[hits[0]]
         return None
@@ -492,6 +506,21 @@ def _signature_return(sig: str, name: str, kind: str) -> str:
         return ""
     middle = [t for t in tokens[:-1] if t not in _SIGNATURE_LEADERS]
     return " ".join(middle)
+
+
+#: Method qualifiers in SystemVerilog source order: ``protected static``,
+#: ``pure virtual``, ``local virtual``.
+_QUALIFIER_RANK = {"local": 0, "protected": 0, "static": 1, "pure": 2, "virtual": 3}
+
+
+def _ordered_qualifiers(qualifiers: str, virtual: bool) -> str:
+    """The qualifier string as SV writes it: the method qualifiers above in
+    rank order, then any others (``rand``, ``interface``, ...) as given."""
+    words = qualifiers.split()
+    if virtual and "virtual" not in words:
+        words.append("virtual")
+    known = sorted((w for w in words if w in _QUALIFIER_RANK), key=_QUALIFIER_RANK.get)
+    return " ".join(known + [w for w in words if w not in _QUALIFIER_RANK])
 
 
 #: Words that may lead a hand-written subroutine signature but are not part of

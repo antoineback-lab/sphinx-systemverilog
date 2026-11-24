@@ -35,11 +35,13 @@ from sphinx.ext.graphviz import graphviz
 from sphinx.util import logging
 
 from ..model.uvm import (
+    ACT_CALL,
     OVERRIDE_INST,
     SEQUENCE_BASE,
     STATE_OK,
     STATE_OPAQUE,
     STATE_UNRESOLVED,
+    UVM_TASK_PHASES,
 )
 from .structure import _TREE_RAWSOURCE, _build_table, _type_ref
 from .uvm_activity import build_activity_dot
@@ -55,9 +57,19 @@ logger = logging.getLogger(__name__)
 #: Stated on every testbench view.  The single most important sentence in the
 #: feature: everything here is a claim about source, never about a run.
 UVM_SCOPE_NOTE = (
-    "Hierarchy as written in build_phase — not a simulation trace. "
+    "Hierarchy as written in build_phase and the methods it calls — not a "
+    "simulation trace. "
     "Factory overrides, config-driven counts and dynamically named "
     "components are reported as such rather than resolved."
+)
+
+#: The resolved tree's version. It does apply overrides, so the sentence that
+#: matters is which parts of a run it still cannot know.
+UVM_RESOLVED_SCOPE_NOTE = (
+    "Hierarchy as a run would build it from build_phase and the methods it "
+    "calls, with factory overrides applied as the IEEE 1800.2 factory applies "
+    "them — not a simulation trace. Conditions are not evaluated, a loop is "
+    "shown as one component, and config_db settings do not change the tree."
 )
 
 #: The same obligation, worded for a view that is about accesses rather than
@@ -123,14 +135,14 @@ class _UvmDirective(Directive):
 
         provider = getattr(index, "uvm_provider", None)
         if provider is None:
-            # The index was unpickled from Sphinx's environment, so the live
-            # compilation is gone.  Degrade with an actionable warning rather
-            # than crashing a build that may not even be about this page.
+            # Nothing was parsed, so there is no testbench.  Degrade with an
+            # actionable warning rather than crashing a build that may not
+            # even be about this page.
             if "optional" not in self.options:
                 logger.warning(
-                    "sphinx-systemverilog: the elaborated testbench is not "
-                    "available in this process, so %s cannot render; a full "
-                    "rebuild (sphinx-build -E) will restore it",
+                    "sphinx-systemverilog: no SystemVerilog sources were "
+                    "parsed, so %s cannot render; check sv_source_dirs and "
+                    "sv_build_units",
                     self.what, type="systemverilog",
                     location=(env.docname, self.lineno),
                 )
@@ -186,6 +198,7 @@ class SvUvmTree(_UvmDirective):
     option_spec = {
         "depth": directives.nonnegative_int,
         "collapse": directives.flag,
+        "resolved": directives.flag,
         "optional": directives.flag,
     }
 
@@ -196,6 +209,8 @@ class SvUvmTree(_UvmDirective):
         env = self.state.document.settings.env
 
         depth = self.options.get("depth", env.config.sv_uvm_tree_depth)
+        if "resolved" in self.options:
+            return self._run_resolved(structure, depth)
 
         block = nodes.literal_block(_TREE_RAWSOURCE, classes=["sv-uvm-tree"])
         block += _type_ref(structure.root)
@@ -214,6 +229,124 @@ class SvUvmTree(_UvmDirective):
         )
 
         return [block] + self._notes(structure, state, depth, overrides)
+
+    # -- :resolved: ------------------------------------------------------------
+
+    def _run_resolved(self, structure, depth: int) -> list[nodes.Node]:
+        """The stitched tree (``svdb uvm-tree``): instances, with the types the
+        factory builds. Siblings are never folded --- an inst override can make
+        two same-typed siblings build different subtrees."""
+        env = self.state.document.settings.env
+        try:
+            tree = self._provider().uvm_tree(self._requested_root())
+        except Exception as e:  # noqa: BLE001 - a page must still build
+            logger.warning(
+                "sphinx-systemverilog: UVM tree cannot apply the factory "
+                "overrides (%s); showing the tree as written", e,
+                type="systemverilog", location=(env.docname, self.lineno),
+            )
+            self.options.pop("resolved", None)
+            return self.run()
+        if tree.root is None:
+            return []
+
+        by_path = tree._by_path()
+        block = nodes.literal_block(_TREE_RAWSOURCE, classes=["sv-uvm-tree", "sv-uvm-resolved"])
+        block += nodes.Text(f"{tree.root.name} : ")
+        _append_resolved_type(block, tree.root)
+        block += nodes.Text("\n")
+        state = _ResolvedState()
+        self._render_resolved(block, by_path, tree.root, "", depth, 1, state)
+        return [block] + self._resolved_notes(structure, tree, state, depth)
+
+    def _render_resolved(self, block, by_path, node, prefix: str, depth: int,
+                         level: int, state: "_ResolvedState") -> None:
+        children = [by_path[p] for p in node.children if p in by_path]
+        if not children:
+            return
+        if level > depth:
+            state.elide(by_path, children, 1)
+            return
+        width = max(len(c.name) for c in children)
+        for position, child in enumerate(children):
+            last = position == len(children) - 1
+            block += nodes.Text(prefix + (_ELBOW if last else _TEE) + f"{child.name.ljust(width)} : ")
+            _append_resolved_type(block, child)
+            if child.multiplicity != "1":
+                block += nodes.Text(f"   (×{child.multiplicity})")
+            if child.conditional:
+                block += nodes.Text("  [conditional]")
+            if child.state != STATE_OK:
+                block += nodes.Text(f"  [{child.state}]")
+            block += nodes.Text("\n")
+            state.count(child)
+            self._render_resolved(block, by_path, child, prefix + (_BLANK if last else _PIPE),
+                                  depth, level + 1, state)
+
+    def _resolved_notes(self, structure, tree, state: "_ResolvedState",
+                        depth: int) -> list[nodes.Node]:
+        out: list[nodes.Node] = []
+        if state.overridden:
+            out.append(self._note(
+                f"{state.overridden} component(s) above are built as a different "
+                "type than their create call names, shown as declared → built. "
+                "Overrides are applied in the order build_phase registers them, "
+                "children built in name order, as a run applies them."
+            ))
+        unknown = [o for o in tree.overrides if o.status == "unknown_type"]
+        if unknown:
+            names = ", ".join(sorted({o.replacement.rsplit("::", 1)[-1] for o in unknown}))
+            out.append(self._note(
+                f"{len(unknown)} factory override(s) name a type that is not in "
+                f"the parsed sources ({names}) and never apply.",
+                extra_class="sv-uvm-unresolved",
+            ))
+        issues = [i for i in tree.issues if i.code != "max_nodes"]
+        if issues:
+            para = self._note(f"{len(issues)} issue(s) found while building the tree:")
+            items = nodes.bullet_list(classes=["sv-uvm-issues"])
+            for i in issues:
+                item = nodes.list_item()
+                text = nodes.paragraph()
+                text += nodes.literal(i.code, i.code)
+                text += nodes.Text(f": {i.message}" + (f" ({i.path})" if i.path else ""))
+                item += text
+                items += item
+            out += [para, items]
+        if tree.truncated:
+            out.append(self._note(
+                f"The tree was cut short after {len(tree.nodes)} component(s); "
+                "this view is incomplete."
+            ))
+        if state.elided_levels:
+            out.append(self._note(
+                f"{state.elided_levels} deeper level(s) containing "
+                f"{state.elided_components} component(s) not shown — raise "
+                f":depth: (currently {depth})."
+            ))
+        if state.unresolved:
+            names = ", ".join(sorted({n.type.rsplit("::", 1)[-1] for n in state.unresolved}))
+            out.append(self._note(
+                f"{len(state.unresolved)} component(s) could not be resolved "
+                f"({names}). Their types are not present in the parsed sources, "
+                "so nothing below them is known.",
+                extra_class="sv-uvm-unresolved",
+            ))
+        if state.opaque:
+            out.append(self._note(
+                f"{len(state.opaque)} component(s) shown as boundaries and not "
+                "expanded (sv_uvm_blackbox / sv_uvm_blackbox_bases, plus UVM "
+                "library types)."
+            ))
+        if len(structure.root_candidates) > 1:
+            others = ", ".join(n for n in structure.root_candidates if n != structure.root)
+            out.append(self._note(
+                f"This project contains more than one test; showing "
+                f"{structure.root}. Others: {others}. Name one as the directive "
+                "argument to choose."
+            ))
+        out.append(self._note(UVM_RESOLVED_SCOPE_NOTE))
+        return out
 
     # -- rendering ------------------------------------------------------------
 
@@ -365,6 +498,39 @@ class _RenderState:
                         (grandchildren, level + 1, path + (child.type_name,))
                     )
         self.elided_levels = max(self.elided_levels, deepest)
+
+
+class _ResolvedState:
+    """What the resolved tree must report but cannot show inline."""
+
+    def __init__(self) -> None:
+        self.unresolved: list[Any] = []
+        self.opaque: list[Any] = []
+        self.overridden = 0
+        self.elided_levels = 0
+        self.elided_components = 0
+
+    def count(self, node) -> None:
+        if node.state == STATE_UNRESOLVED:
+            self.unresolved.append(node)
+        elif node.state == STATE_OPAQUE:
+            self.opaque.append(node)
+        if node.declared and node.declared != node.type:
+            self.overridden += 1
+
+    def elide(self, by_path, children, level: int) -> None:
+        for child in children:
+            self.elided_components += 1
+            self.elided_levels = max(self.elided_levels, level)
+            self.elide(by_path, [by_path[p] for p in child.children if p in by_path], level + 1)
+
+
+def _append_resolved_type(block: nodes.Element, node) -> None:
+    """``declared → built`` when an override changed the type, else ``built``."""
+    if node.declared and node.declared != node.type:
+        block += _type_ref(node.declared.rsplit("::", 1)[-1])
+        block += nodes.Text(" → ")
+    block += _type_ref(node.type.rsplit("::", 1)[-1])
 
 
 # -- line rendering -----------------------------------------------------------
@@ -763,6 +929,9 @@ class SvUvmSequence(_UvmDirective):
     option_spec = {
         "depth": directives.nonnegative_int,
         "optional": directives.flag,
+        "catalog": directives.flag,
+        "tree": directives.flag,
+        "used-by": directives.flag,
     }
 
     def run(self) -> list[nodes.Node]:
@@ -772,24 +941,21 @@ class SvUvmSequence(_UvmDirective):
             return []
 
         name = self._requested_root()
-        sequence = provider.sequence(name)
+        sequence = self._lookup(provider, name)
         if sequence is None:
             if "optional" not in self.options:
-                logger.warning(
-                    "sphinx-systemverilog: %s cannot find a UVM sequence named "
-                    "%r; the class is either absent from the parsed sources or "
-                    "does not derive from %s",
-                    self.what, name, SEQUENCE_BASE, type="systemverilog",
-                    location=(env.docname, self.lineno),
-                )
+                self._not_found(name, env)
             return []
 
         if not sequence.overridden:
             # Not a failure, and not something to draw an empty box for: the
-            # sequence really does inherit the library's empty `body()`.
+            # class really does inherit the library's empty task.
+            method = f"{sequence.method}()"
+            inherited = (f"; it inherits the empty one from {sequence.declared_by}"
+                         if sequence.declared_by else "")
             return [self._note(
-                f"{name} does not define a body(); it inherits the empty one "
-                f"from {sequence.declared_by}. There is nothing to draw."
+                f"{name} does not define {'a ' if method == 'body()' else ''}"
+                f"{method}{inherited}. There is nothing to draw."
             )]
 
         depth = max(1, self.options.get("depth", 1))
@@ -801,7 +967,26 @@ class SvUvmSequence(_UvmDirective):
         node["code"] = code
         node["options"] = {"docname": env.docname}
         node["alt"] = f"UVM activity diagram of {name}"
-        return [node] + self._notes(sequence, diagram)
+        out = [node] + self._notes(sequence, diagram)
+        if "catalog" in self.options:
+            out += _catalog_nodes(self, provider.catalog(name, sequence.method))
+        if "tree" in self.options:
+            out += _tree_nodes(self, provider.tree(name, sequence.method))
+        if "used-by" in self.options:
+            out += _users_nodes(self, provider.users(name))
+        return out
+
+    def _lookup(self, provider, name: str):
+        return provider.sequence(name)
+
+    def _not_found(self, name: str, env) -> None:
+        logger.warning(
+            "sphinx-systemverilog: %s cannot find a UVM sequence named "
+            "%r; the class is either absent from the parsed sources or "
+            "does not derive from %s",
+            self.what, name, SEQUENCE_BASE, type="systemverilog",
+            location=(env.docname, self.lineno),
+        )
 
     def _subsequences(self, provider, sequence, depth: int) -> dict:
         """Every sub-sequence reachable within *depth* levels, by type name.
@@ -854,16 +1039,63 @@ class SvUvmSequence(_UvmDirective):
                 "one step, however many statements it expands to."
             ))
 
+        calls = [n for n in sequence.walk() if n.kind == ACT_CALL]
+        if calls:
+            names = list(dict.fromkeys(n.label for n in calls))
+            stopped = list(dict.fromkeys(n.label for n in calls if not n.children))
+            text = ("Tasks of the class that it calls (" + ", ".join(names) + ") are "
+                    "drawn in place, in dotted boxes, dispatched from "
+                    f"{sequence.name.split('::')[-1]} as a virtual call would be.")
+            if stopped:
+                text += (" Drawn as a single box, because the task draws nothing, "
+                         "is already being called, or is nested too deeply: "
+                         + ", ".join(stopped) + ".")
+            out.append(self._note(text))
+
         if sequence.other:
             out.append(self._note(
-                f"{sequence.other} statement(s) in body() are not drawn. "
+                f"{sequence.other} statement(s) in {sequence.method}() are not drawn. "
                 "Reporting, assignment and randomization are not control flow, "
                 "and a diagram of only the constructs it understands would be "
                 "claiming the task is shorter than it is."
             ))
 
-        out.append(self._note(UVM_SEQUENCE_SCOPE_NOTE))
+        out.append(self._note(
+            UVM_SEQUENCE_SCOPE_NOTE.replace("body()", f"{sequence.method}()")))
         return out
+
+
+class SvUvmActivity(SvUvmSequence):
+    """``.. sv:uvm-activity:: seq_test`` -> a behavioural task as a UML
+    activity diagram: a component's task phase, or a sequence's ``body()``.
+
+    A test's ``run_phase`` runs behaviour exactly as a sequence's ``body()``
+    does --- it starts sequences, forks, waits --- so it is drawn the same way,
+    with the objections and event waits that are particular to a phase as
+    steps of their own.  ``:method:`` names the task; without it a component
+    draws ``run_phase`` and a sequence ``body()``.
+    """
+
+    what = "UVM activity diagram"
+    option_spec = {
+        **SvUvmSequence.option_spec,
+        "method": directives.unchanged,
+    }
+
+    def _lookup(self, provider, name: str):
+        return provider.activity(name, (self.options.get("method") or "").strip())
+
+    def _not_found(self, name: str, env) -> None:
+        method = (self.options.get("method") or "").strip()
+        logger.warning(
+            "sphinx-systemverilog: %s cannot find %s on a UVM class named %r; "
+            "the class is either absent from the parsed sources, is neither a "
+            "sequence nor a component, or the method is not one of its tasks "
+            "(body for a sequence; %s for a component)",
+            self.what, f"{method}()" if method else "a behavioural task", name,
+            ", ".join(UVM_TASK_PHASES), type="systemverilog",
+            location=(env.docname, self.lineno),
+        )
 
 
 class SvUvmBinding(_UvmDirective):
@@ -1160,11 +1392,402 @@ def _joined_refs(names: list[str]) -> list[nodes.Node]:
     return out
 
 
+class SvUvmSequenceCatalog(SvUvmActivity):
+    """``.. sv:uvm-sequence-catalog:: seq_test`` -> every sequence a behavioural
+    task depends on, each listed once.
+
+    The activity diagram shows one task at a time; this is the closure, which
+    is what answers "what do we depend on?".  Each row says how the sequence's
+    type was worked out, who starts it and where, which database it comes
+    from, and which transactions it drives.  ``:method:`` picks the task as for
+    ``sv:uvm-activity``.
+    """
+
+    what = "UVM sequence catalog"
+    option_spec = {
+        "method": directives.unchanged,
+        "optional": directives.flag,
+    }
+
+    def run(self) -> list[nodes.Node]:
+        env = self.state.document.settings.env
+        provider = self._provider()
+        if provider is None:
+            return []
+        name = self._requested_root()
+        task = self._lookup(provider, name)
+        if task is None:
+            if "optional" not in self.options:
+                self._not_found(name, env)
+            return []
+        if not task.overridden:
+            return [self._note(
+                f"{name} does not define {task.method}(), so it depends on no "
+                "sequences."
+            )]
+        return _catalog_nodes(self, provider.catalog(name, task.method))
+
+
+class SvUvmSequenceTree(SvUvmSequenceCatalog):
+    """``.. sv:uvm-sequence-tree:: seq_test`` -> the sequences a behavioural
+    task starts, nested under the sequence that starts each one.
+
+    The catalog's companion: the catalog lists each sequence once, the tree
+    shows every start in place, with the loops, branches and helper tasks
+    around it.  A sequence started again after it was opened is not opened
+    twice.  ``:method:`` picks the task as for ``sv:uvm-activity``.
+    """
+
+    what = "UVM sequence tree"
+
+    def run(self) -> list[nodes.Node]:
+        env = self.state.document.settings.env
+        provider = self._provider()
+        if provider is None:
+            return []
+        name = self._requested_root()
+        task = self._lookup(provider, name)
+        if task is None:
+            if "optional" not in self.options:
+                self._not_found(name, env)
+            return []
+        if not task.overridden:
+            return [self._note(
+                f"{name} does not define {task.method}(), so it starts no sequences."
+            )]
+        return _tree_nodes(self, provider.tree(name, task.method))
+
+
+class SvUvmSequenceUsers(SvUvmSequence):
+    """``.. sv:uvm-sequence-users:: cfg_seq`` -> everything that depends on a
+    sequence: where it is started, and every test task and sequence whose
+    catalog lists it.
+
+    The reverse of :class:`SvUvmSequenceCatalog`, and read off the same
+    catalogs, so the two always agree --- including on a sequence a test
+    reaches only through a factory override it registers.  It answers the
+    question asked before changing a sequence: who is affected?
+    """
+
+    what = "UVM sequence users"
+    option_spec = {"optional": directives.flag}
+
+    def run(self) -> list[nodes.Node]:
+        env = self.state.document.settings.env
+        provider = self._provider()
+        if provider is None:
+            return []
+        name = self._requested_root()
+        if provider.sequence(name) is None:
+            if "optional" not in self.options:
+                self._not_found(name, env)
+            return []
+        return _users_nodes(self, provider.users(name))
+
+
+#: How each ``RESOLVED_*`` value is written in the catalog.
+_RESOLUTION_TEXT = {"created": "created", "member": "created in {created_in}",
+                    "declared": "declared type only"}
+
+
+def _site_resolution(site) -> str:
+    """How one start's type was worked out, as the catalog writes it."""
+    text = _RESOLUTION_TEXT.get(site.resolved, site.resolved).format(
+        created_in=f"{site.created_in}()" if site.created_in else "another method")
+    if site.original:
+        text += f", overridden from {site.original}"
+    return text
+
+
+def _override_text(o) -> str:
+    """``cool_seq → cold_seq (conditional, in dep_test.build_phase)``."""
+    why = []
+    if o.kind == "inst":
+        why.append(f"instance {o.inst_path}" if o.inst_path else "instance override")
+    if o.conditional:
+        why.append("conditional")
+    why.append(f"in {o.where}")
+    return f"{o.original} → {o.replacement or '?'} ({', '.join(why)})"
+
+
+def _catalog_nodes(directive: _UvmDirective, catalog) -> list[nodes.Node]:
+    """The catalog table and its notes, shared by the catalog directive and
+    the ``:catalog:`` option of the activity directives."""
+    if catalog is None:
+        return []
+    env = directive.state.document.settings.env
+    task = f"{catalog.root}'s {catalog.method}()"
+    if not catalog.entries:
+        out = [directive._note(f"{task} starts no sub-sequences.")]
+        if catalog.items:
+            out.append(_items_note(directive, task, catalog.items))
+        return out
+
+    rows = [_catalog_row(env, entry) for entry in catalog.entries]
+    table = _build_table(
+        ["Sequence", "Started by", "Type from", "Started at", "Origin", "Drives"],
+        rows, classes=["sv-uvm-catalog"],
+    )
+    direct, transitive = len(catalog.direct), len(catalog.transitive)
+    out: list[nodes.Node] = [directive._note(
+        f"{task} depends on {len(catalog.entries)} sequence(s): {direct} started "
+        f"directly and {transitive} through other sequences."
+    ), table]
+    if catalog.items:
+        out.append(_items_note(directive, task, catalog.items))
+
+    if catalog.applied:
+        out.append(directive._note(
+            "Factory type overrides applied, because the class or a base class "
+            "registers them unconditionally: "
+            + "; ".join(_override_text(o) for o in catalog.applied) + "."
+        ))
+    possible = [o for e in catalog.entries for o in e.possible]
+    if possible:
+        out.append(directive._note(
+            "Factory overrides that may replace a listed sequence, but are not "
+            "certain to for this task: "
+            + "; ".join(_override_text(o) for o in possible)
+            + ". What the replacements start is not listed.",
+            extra_class="sv-uvm-unresolved",
+        ))
+
+    declared = [e.type_name for e in catalog.entries if "declared" in e.resolutions]
+    if declared:
+        out.append(directive._note(
+            "'declared type only' means no create or new for the handle was "
+            "found in the task that starts it, so the type shown is the handle's "
+            "declared type. A create elsewhere or a factory override may start a "
+            "different sequence (" + ", ".join(declared) + ")."
+        ))
+    missing = [e.type_name for e in catalog.entries if not e.found]
+    if missing:
+        out.append(directive._note(
+            f"{len(missing)} sequence(s) have no body() here ("
+            + ", ".join(missing) + "), so what they start in turn is not listed.",
+            extra_class="sv-uvm-unresolved",
+        ))
+    if any(e.recursive for e in catalog.entries):
+        out.append(directive._note(
+            "A sequence marked (recursive) can start itself again, directly or "
+            "through others; it is listed once."
+        ))
+    if catalog.truncated:
+        out.append(directive._note(
+            "The catalog stopped at its size limit; more sequences are reachable.",
+            extra_class="sv-uvm-unresolved",
+        ))
+    return out
+
+
+def _tree_nodes(directive: _UvmDirective, tree) -> list[nodes.Node]:
+    """The nested sequence tree, shared by ``sv:uvm-sequence-tree`` and the
+    ``:tree:`` option."""
+    if tree is None:
+        return []
+    env = directive.state.document.settings.env
+    task = f"{tree.root.split('::')[-1]}.{tree.method}()"
+    if not tree.children:
+        return [directive._note(f"{task} starts no sequences.")]
+    starts = list(tree.walk())
+    out: list[nodes.Node] = [
+        directive._note(f"{task} starts sequences in {len(starts)} place(s), nested "
+                        "below under the sequence that starts each one."),
+        _tree_list(env, tree.children),
+    ]
+    if tree.applied:
+        out.append(directive._note(
+            "Factory type overrides applied: "
+            + "; ".join(_override_text(o) for o in tree.applied) + "."
+        ))
+    if any(n.sequencer_path for n in starts):
+        out.append(directive._note(
+            "Sequencer instances are found in the component tree built from "
+            f"{tree.root.split('::')[-1]}: a start in a sequence runs on that "
+            "sequence's own sequencer (m_sequencer, or none given) or on a handle "
+            "reached from it (p_sequencer.x). A sequencer handle fetched from "
+            "config_db or passed in is not followed."
+        ))
+    if any(n.repeated for n in starts):
+        out.append(directive._note(
+            "A sequence marked (shown above) is opened where it is first "
+            "started; what it starts is not repeated."
+        ))
+    if tree.truncated:
+        out.append(directive._note(
+            "The tree stopped at its size limit; more starts are reachable.",
+            extra_class="sv-uvm-unresolved",
+        ))
+    return out
+
+
+def _tree_list(env, children) -> nodes.bullet_list:
+    from .structure import _source_ref
+
+    out = nodes.bullet_list(classes=["sv-uvm-sequence-tree"])
+    for node in children:
+        para = nodes.paragraph()
+        if node.handle:
+            para += nodes.literal(node.handle, node.handle)
+            para += nodes.Text(": ")
+        para += _type_ref(node.type_name)
+        flags = []
+        if node.recursive:
+            flags.append("recursive")
+        elif node.repeated:
+            flags.append("shown above")
+        if not node.found:
+            flags.append("no body found")
+        if node.origin:
+            flags.append(f"from {node.origin}")
+        if flags:
+            para += nodes.Text(f" ({', '.join(flags)})")
+        detail = [_site_resolution(node)]
+        if node.context:
+            detail.append("in " + ", ".join(node.context))
+        if node.via:
+            detail.append("through " + " → ".join(node.via))
+        para += nodes.Text(" — " + "; ".join(detail))
+        if node.sequencer or node.sequencer_path:
+            para += nodes.Text("; on ")
+            if node.sequencer:
+                para += nodes.literal(node.sequencer, node.sequencer)
+            if node.sequencer_path:
+                if node.sequencer:
+                    para += nodes.Text(" = ")
+                para += nodes.literal(node.sequencer_path, node.sequencer_path)
+                para += nodes.Text(" (")
+                para += _type_ref(node.sequencer_type)
+                para += nodes.Text(")")
+        ref = _source_ref(env, node.location)
+        if ref is not None:
+            para += nodes.Text(" ")
+            para += ref
+        item = nodes.list_item("", para)
+        if node.children:
+            item += _tree_list(env, node.children)
+        out += item
+    return out
+
+
+def _items_note(directive: _UvmDirective, task: str, items) -> nodes.paragraph:
+    para = directive._note(f"{task} also drives transactions itself: ")
+    para += _joined_refs(list(items))
+    para += nodes.Text(".")
+    return para
+
+
+def _catalog_row(env, entry) -> list[nodes.Node]:
+    name = nodes.inline()
+    name += _type_ref(entry.type_name)
+    flags = []
+    if entry.recursive:
+        flags.append("recursive")
+    if not entry.found:
+        flags.append("no body found")
+    elif not entry.defines_body:
+        flags.append("empty body")
+    if entry.possible:
+        flags.append("possibly overridden")
+    if flags:
+        name += nodes.Text(f"  ({', '.join(flags)})")
+
+    texts: list[str] = []
+    for site in entry.sites:
+        text = _site_resolution(site)
+        if text not in texts:
+            texts.append(text)
+    resolved = nodes.Text("; ".join(texts))
+
+    origin = nodes.literal(entry.origin, entry.origin) if entry.origin \
+        else nodes.emphasis("", "this design")
+    drives = _joined_refs(list(entry.items)) if entry.items else nodes.Text("")
+    return [name, _joined_refs(entry.started_by), resolved, _sites_where(env, entry.sites), origin, drives]
+
+
+def _sites_where(env, sites) -> nodes.inline:
+    """``file:line on <sequencer>`` for each start, linked to the source."""
+    import os
+
+    from .structure import _source_ref
+
+    where = nodes.inline()
+    for position, site in enumerate(sites):
+        if position:
+            where += nodes.Text("; ")
+        loc = site.location
+        text = f"{os.path.basename(loc.file)}:{loc.line}" if loc is not None else site.handle
+        where += nodes.literal(text, text)
+        if site.sequencer:
+            where += nodes.Text(" on ")
+            where += nodes.literal(site.sequencer, site.sequencer)
+        if site.macro:
+            where += nodes.Text(f" (`{site.macro})")
+        if site.via:
+            where += nodes.Text(" in ")
+            where += nodes.literal(" → ".join(site.via), " → ".join(site.via))
+        ref = _source_ref(env, loc)
+        if ref is not None:
+            where += nodes.Text(" ")
+            where += ref
+    return where
+
+
+def _users_nodes(directive: _UvmDirective, users) -> list[nodes.Node]:
+    """The sequence-users table and its summary, shared by
+    ``sv:uvm-sequence-users`` and the ``:used-by:`` option."""
+    if users is None:
+        return []
+    env = directive.state.document.settings.env
+    replaces = []
+    if users.replaces:
+        replaces.append(directive._note(
+            f"{users.name} can also run in place of another sequence, through a "
+            "factory override: " + "; ".join(_override_text(o) for o in users.replaces) + "."
+        ))
+    if not users.users:
+        return [directive._note(
+            f"Nothing in this design starts {users.name}: no test task or "
+            "sequence depends on it."
+        )] + replaces
+    rows = []
+    for site in users.sites:
+        task = nodes.inline()
+        task += _type_ref(site.started_by)
+        task += nodes.Text(f".{site.method}()")
+        rows.append([task, nodes.Text(_site_resolution(site)), _sites_where(env, [site])])
+    table = _build_table(["Started by", "Type from", "Started at"], rows,
+                         classes=["sv-uvm-sequence-users"])
+    tests, seqs = users.components, users.sequences
+    out: list[nodes.Node] = [directive._note(
+        f"{users.name} is started in {len(users.sites)} place(s). "
+        f"{len(tests)} component task(s) and {len(seqs)} sequence(s) depend on it."
+    ), table]
+    for label, group in (("Component tasks", tests), ("Sequences", seqs)):
+        if not group:
+            continue
+        para = directive._note(f"{label} that depend on it: ")
+        for position, user in enumerate(group):
+            if position:
+                para += nodes.Text(", ")
+            para += _type_ref(user.root.split("::")[-1])
+            how = "directly" if user.depth == 1 else \
+                f"through {user.depth - 1} other sequence level(s)"
+            para += nodes.Text(f".{user.method}() ({how})")
+        para += nodes.Text(".")
+        out.append(para)
+    return out + replaces
+
+
 UVM_DIRECTIVES = {
     "uvm-tree": SvUvmTree,
     "uvm-config": SvUvmConfig,
     "uvm-schematic": SvUvmSchematic,
     "uvm-sequence": SvUvmSequence,
+    "uvm-activity": SvUvmActivity,
+    "uvm-sequence-catalog": SvUvmSequenceCatalog,
+    "uvm-sequence-users": SvUvmSequenceUsers,
+    "uvm-sequence-tree": SvUvmSequenceTree,
     "uvm-binding": SvUvmBinding,
     "uvm-used-by": SvUvmUsedBy,
 }

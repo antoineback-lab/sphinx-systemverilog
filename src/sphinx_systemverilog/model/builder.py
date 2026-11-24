@@ -8,7 +8,9 @@ targets self-contained packages; Phase 2 adds include/define-driven elaboration.
 
 from __future__ import annotations
 
+import os
 import re
+from fnmatch import fnmatchcase
 from typing import Any, Iterable
 
 from .comments import clean_comment_block, doc_above_line, split_leading_trivia
@@ -39,6 +41,13 @@ from pyslang.parsing import Token
 from pyslang.syntax import SyntaxTree
 
 
+#: Diagnostics an ``sv_external`` pattern silences for the names it matches.
+#: ``UndeclaredIdentifier`` is how slang reports a class used as a type
+#: (``axi_vip_cfg cfg;``); ``UnknownPackage``, a VIP package import.
+_EXTERNAL_CODES = frozenset({"UnknownModule", "UnknownInterface", "UnknownClass", "UnknownClassOrPackage",
+                             "UnknownPackage", "UndeclaredIdentifier"})
+
+
 class ModelBuilder:
     """Parse SystemVerilog and emit a list of top-level :class:`SvObject`."""
 
@@ -49,6 +58,9 @@ class ModelBuilder:
         defines: dict[str, str] | None = None,
         nodocs_policy: str = "include",
         document_macros: bool = True,
+        external: Iterable[str] | None = None,
+        external_files: dict[str, str] | None = None,
+        links: Iterable[str] | None = None,
     ) -> None:
         self.doc_style = doc_style
         self.include_dirs = list(include_dirs or [])
@@ -57,6 +69,11 @@ class ModelBuilder:
         self.nodocs_policy = nodocs_policy
         #: Whether to extract ``\\`define`` macros.
         self.document_macros = document_macros
+        #: ``sv_external`` glob patterns: names defined outside the sources.
+        self.external = list(external or [])
+        #: ``sv_external_sources``: absolute path -> origin label.  Parsed like
+        #: any source; what they declare is flagged ``external``.
+        self.external_files = {os.path.abspath(k): v for k, v in (external_files or {}).items()}
         #: The live pyslang ``Compilation``, retained after :meth:`_build` so the
         #: instance hierarchy can be walked lazily.  Never walked during a build.
         self.compilation: Any = None
@@ -64,6 +81,11 @@ class ModelBuilder:
         self.source_manager: Any = None
         #: Error/fatal diagnostics rendered as strings; surfaced as warnings.
         self.diagnostics: list[str] = []
+        #: Link databases (``svdb build --link``): names the sources use but do
+        #: not define are compiled from declarations generated from these.
+        self.links = list(links or [])
+        #: What the compile took from each link database (``Link`` records).
+        self.linked: list[Any] = []
         #: Count of suppressed non-error (lint) diagnostics; surfaced as info.
         self.suppressed_count: int = 0
         self._nd_index = None
@@ -75,14 +97,31 @@ class ModelBuilder:
         return self._build([tree])
 
     def build_from_files(self, paths: Iterable[str]) -> list[SvObject]:
+        paths = [str(p) for p in paths]
         sm, options = self._parse_options()
+        linker = None
+        if self.links:
+            from ..frontend.link import Linker
+
+            if sm is None:
+                sm, options = pyslang.SourceManager(), pyslang.Bag([pyslang.parsing.PreprocessorOptions()])
+            linker = Linker(self.links, self.include_dirs)
+            linker.preinclude(sm, paths)
         trees = []
         for p in paths:
             if sm is not None:
-                trees.append(SyntaxTree.fromFile(str(p), sm, options))
+                trees.append(SyntaxTree.fromFile(p, sm, options))
             else:
-                trees.append(SyntaxTree.fromFile(str(p)))
-        return self._build(trees)
+                trees.append(SyntaxTree.fromFile(p))
+        if linker is None:
+            return self._build(trees)
+        try:
+            comp = linker.link(sm, trees)
+            self.linked = linker.used()
+            self.diagnostics.extend(linker.errors)
+            return self._build(trees, linked=linker.trees, comp=comp)
+        finally:
+            linker.close()
 
     def _parse_options(self):
         """Build a shared SourceManager + options Bag honoring include dirs/defines.
@@ -107,19 +146,20 @@ class ModelBuilder:
 
     # -- core -----------------------------------------------------------------
 
-    def _build(self, trees: list[Any]) -> list[SvObject]:
-        comp = Compilation()
-        source_manager = None
-        for tree in trees:
-            comp.addSyntaxTree(tree)
-            if source_manager is None:
-                source_manager = tree.sourceManager
+    def _build(self, trees: list[Any], linked: list[Any] = (), comp: Any = None) -> list[SvObject]:
+        """*linked* trees (generated from link databases) are compiled, not
+        documented; *comp*, when given, already holds every tree."""
+        source_manager = trees[0].sourceManager if trees else None
+        if comp is None:
+            comp = Compilation()
+            for tree in [*trees, *linked]:
+                comp.addSyntaxTree(tree)
         self._collect_diagnostics(comp)
         self._build_nd_index(trees, source_manager)
 
         roots: list[SvObject] = []
         for pkg in comp.getPackages():
-            if pkg.name in ("std", "$unit"):
+            if pkg.name in ("std", "$unit") or _is_linked(source_manager, pkg.location):
                 continue
             obj = self._build_scope(
                 pkg, KIND_PACKAGE, source_manager, pkg.name, include_inline=True
@@ -129,7 +169,7 @@ class ModelBuilder:
         # Modules/interfaces/programs (Phase 2 fleshes out ports/params).
         for defn in comp.getDefinitions():
             kind = _DEFINITION_KINDS.get(str(getattr(defn, "definitionKind", "")))
-            if kind is None:
+            if kind is None or _is_linked(source_manager, defn.location):
                 continue
             obj = self._build_scope(
                 defn, kind, source_manager, defn.name, include_inline=True
@@ -229,6 +269,8 @@ class ModelBuilder:
         engine = pyslang.DiagnosticEngine(comp.sourceManager)
         suppressed = 0
         for diag in diags:
+            if self._is_external(diag) or _is_linked(comp.sourceManager, diag.location):
+                continue        # in generated text: the linker reports those
             try:
                 severity = engine.getSeverity(diag.code, diag.location)
             except Exception:
@@ -244,6 +286,25 @@ class ModelBuilder:
             except Exception:
                 self.diagnostics.append(str(getattr(diag, "code", diag)))
         self.suppressed_count += suppressed
+
+    def origin_of(self, path: str | None) -> str | None:
+        """The ``sv_external_sources`` origin of the file at *path*, or ``None``
+        when it is one of the project's own sources."""
+        if not path or not self.external_files:
+            return None
+        return self.external_files.get(os.path.abspath(path))
+
+    def _is_external(self, diag: Any) -> bool:
+        """Whether *diag* reports a missing module/class whose name matches an
+        ``sv_external`` pattern.  Only those codes, and only matching names: any
+        other unknown name still warns."""
+        if not self.external or str(diag.code).removeprefix("DiagCode(").rstrip(")") not in _EXTERNAL_CODES:
+            return False
+        try:
+            name = str(diag.args[0])
+        except Exception:
+            return False
+        return any(fnmatchcase(name, p) for p in self.external)
 
     # -- per-symbol dispatch --------------------------------------------------
 
@@ -269,7 +330,7 @@ class ModelBuilder:
             return self._build_property(sym, sm, parent_qname)
         if kind == SymbolKind.TypeAlias:
             return self._build_simple(sym, KIND_TYPEDEF, sm, parent_qname,
-                                      signature=f"typedef {sym.name}")
+                                      signature=_typedef_signature(sym))
         if kind == SymbolKind.Definition:
             mapped = _DEFINITION_KINDS.get(str(getattr(sym, "definitionKind", "")))
             if mapped:
@@ -294,11 +355,16 @@ class ModelBuilder:
             doc_style=self.doc_style,
         )
         if class_sym is not None:
-            if getattr(class_sym, "isAbstract", False):
+            if getattr(class_sym, "isInterface", False):
+                obj.qualifiers.append("interface")
+            elif getattr(class_sym, "isAbstract", False):
                 obj.qualifiers.append("virtual")
             base = getattr(class_sym, "baseClass", None)
             if base is not None and getattr(base, "name", ""):
                 obj.extends = base.name
+                generic = getattr(base, "genericClass", None) or base
+                if _is_linked(sm, getattr(generic, "location", None)):
+                    obj.extends_target = getattr(generic, "hierarchicalPath", None) or None
         self._apply_nd(obj, sym)
         if sym.kind == SymbolKind.Definition:
             self._build_module_header(sym, obj, sm, qname)
@@ -309,6 +375,7 @@ class ModelBuilder:
     def _build_members(self, scope: Any, parent: SvObject, sm: Any, qname: str) -> None:
         members: list[SvObject] = []
         trailing: list[list[str]] = []
+        order: dict[int, tuple] = {}
         for sym in _iter_scope(scope):
             if not _has_real_location(sym, sm):
                 continue
@@ -316,6 +383,7 @@ class ModelBuilder:
             if child is None:
                 continue
             child.from_macros = macro_chain(sm, getattr(sym, "location", None))
+            order[id(child)] = _stream_key(sm, getattr(sym, "location", None))
             members.append(child)
             trailing.append(self._trailing_for(sym))
 
@@ -327,7 +395,10 @@ class ModelBuilder:
             if inline and not prev.is_documented:
                 prev.raw_doc = clean_comment_block(inline)
 
-        members.sort(key=lambda m: (m.location.line if m.location else 1 << 30))
+        # Source order across `include`d files, not line numbers alone: a
+        # package spread over files would otherwise put uses before
+        # declarations.
+        members.sort(key=lambda m: order[id(m)])
         parent.children = members
 
     def _build_constraint(
@@ -401,10 +472,20 @@ class ModelBuilder:
             doc_style=self.doc_style,
         )
         syntax = getattr(sym, "syntax", None)
+        word = _cst_class_qualifier(syntax)
+        if word:
+            obj.qualifiers.append(word)
         obj.extends = _extends_from_clause(getattr(syntax, "extendsClause", None))
         self._apply_nd(obj, sym)
         if syntax is not None:
-            obj.children = self._parse_cst_members(syntax, sm, qname)
+            plist = getattr(syntax, "parameters", None)
+            if plist is not None:
+                obj.signature = f"{sym.name} {_tokens_text(plist)}"
+            params = self._parse_parameters(syntax, sm, qname)
+            for p in params:
+                if not p.signature.split(None, 1)[0] in ("parameter", "localparam"):
+                    p.signature = "parameter " + p.signature
+            obj.children = params + self._parse_cst_members(syntax, sm, qname)
         return obj
 
     def _parse_cst_members(self, syntax: Any, sm: Any, qname: str) -> list[SvObject]:
@@ -413,7 +494,11 @@ class ModelBuilder:
             tn = type(item).__name__
             first = len(members)
             try:
-                if "PropertyDeclaration" in tn:
+                decl_tn = type(getattr(item, "declaration", None)).__name__
+                if "PropertyDeclaration" in tn and "Typedef" in decl_tn:
+                    # A class-scope typedef is wrapped as a property declaration.
+                    members.append(self._cst_typedef(item, item.declaration, sm, qname))
+                elif "PropertyDeclaration" in tn:
                     members.extend(self._cst_property(item, sm, qname))
                 elif "MethodPrototype" in tn:
                     members.append(self._cst_method(item, item.prototype, sm, qname))
@@ -421,6 +506,8 @@ class ModelBuilder:
                     members.append(
                         self._cst_method(item, item.declaration.prototype, sm, qname)
                     )
+                elif "TypedefDeclaration" in tn:
+                    members.append(self._cst_typedef(item, item, sm, qname))
             except Exception:
                 continue
             # A parameterized class gets the same `uvm_*_utils treatment as any
@@ -435,16 +522,33 @@ class ModelBuilder:
         out: list[SvObject] = []
         decl = getattr(item, "declaration", item)
         doc = _token_leading_doc(item.getFirstToken())
+        words = {getattr(t, "valueText", "") or str(t).strip()
+                 for node in (getattr(item, "qualifiers", None), getattr(decl, "modifiers", None))
+                 for t in node or ()}
+        quals = [q for q in ("rand", "randc", "static", "const", "var", "local", "protected") if q in words]
         for declarator in _syntax_elements(getattr(decl, "declarators", None)):
             name = declarator.name.valueText
             out.append(SvObject(
                 kind=KIND_PROPERTY, name=name, qualified_name=_join(qname, name),
+                qualifiers=list(quals),
                 signature=_node_source(item, sm),
                 location=resolve_location(sm, declarator.name.location),
                 raw_doc=doc, doc_style=self.doc_style,
             ))
             doc = None  # only the first declarator gets the leading comment
         return out
+
+    def _cst_typedef(self, item: Any, decl: Any, sm: Any, qname: str) -> SvObject | None:
+        name = _name_text(getattr(decl, "name", None))
+        if not name:
+            return None
+        return SvObject(
+            kind=KIND_TYPEDEF, name=name, qualified_name=_join(qname, name),
+            signature=_typedef_text(decl),
+            location=resolve_location(sm, item.getFirstToken().location),
+            raw_doc=_token_leading_doc(item.getFirstToken()),
+            doc_style=self.doc_style,
+        )
 
     def _cst_method(self, item: Any, proto: Any, sm: Any, qname: str) -> SvObject | None:
         name = _name_text(getattr(proto, "name", None))
@@ -456,6 +560,7 @@ class ModelBuilder:
         kind = KIND_TASK if "task" in head.split() else KIND_FUNCTION
         return SvObject(
             kind=kind, name=name, qualified_name=_join(qname, name), signature=sig,
+            qualifiers=_cst_qualifiers(item),
             location=resolve_location(sm, item.getFirstToken().location),
             raw_doc=_token_leading_doc(item.getFirstToken()),
             doc_style=self.doc_style,
@@ -501,9 +606,11 @@ class ModelBuilder:
         for i in range(1, len(params)):
             if trailing[i] and not params[i - 1].is_documented:
                 params[i - 1].raw_doc = clean_comment_block(trailing[i])
-        if params:
-            trailing_last, _ = split_leading_trivia(plist.getLastToken())
-            if trailing_last and not params[-1].is_documented:
+        # The last parameter's trailing comment is trivia of the closing paren.
+        close = getattr(plist, "closeParen", None)
+        if params and close is not None and not params[-1].is_documented:
+            trailing_last, _ = split_leading_trivia(close)
+            if trailing_last:
                 params[-1].raw_doc = clean_comment_block(trailing_last)
         return params
 
@@ -552,12 +659,11 @@ class ModelBuilder:
         obj = self._build_simple(
             sym, kind, sm, qname, signature=_subroutine_signature(sym, is_task)
         )
-        flags = _safe_flags(sym)
-        if "Pure" in flags:
+        if _method_flag(sym, "Pure"):
             obj.qualifiers.append("pure")
         if getattr(sym, "isVirtual", False):
             obj.qualifiers.append("virtual")
-        if "Static" in flags:
+        if _method_flag(sym, "Static"):
             obj.qualifiers.append("static")
         vis = _visibility(sym)
         if vis:
@@ -565,11 +671,10 @@ class ModelBuilder:
         return obj
 
     def _build_property(self, sym: Any, sm: Any, qname: str | None) -> SvObject:
-        type_str, dims = _split_unpacked(str(getattr(sym, "type", "")) or "")
+        type_str, dims = _written_type(sym) or _split_unpacked(str(getattr(sym, "type", "")) or "")
         sig = f"{type_str} {sym.name}{dims}".strip()
         obj = self._build_simple(sym, KIND_PROPERTY, sm, qname, signature=sig)
-        if str(getattr(sym, "randMode", "")) in ("RandMode.Rand", "RandMode.RandC"):
-            obj.qualifiers.append("rand")
+        obj.qualifiers.extend(_property_qualifiers(sym))
         vis = _visibility(sym)
         if vis:
             obj.qualifiers.append(vis)
@@ -676,6 +781,7 @@ _SCOPE_SYNTAX_NAMES = {
     "InterfaceDeclaration",
     "ProgramDeclaration",
     "CovergroupDeclaration",
+    "CheckerDeclaration",
     "CompilationUnit",
 }
 
@@ -750,6 +856,109 @@ def _safe_flags(sym: Any) -> str:
         return ""
 
 
+def _method_flag(sym: Any, name: str) -> bool:
+    """Whether a subroutine or prototype carries ``MethodFlags.<name>``.
+
+    The flags are an integer-valued enum, and ``str()`` of a combination is
+    often a bare number (``"4"``), so test the bit; fall back to the name for a
+    binding that stringifies by name.  Python < 3.11 builds the enum strictly,
+    so a bit the binding does not know makes reading ``sym.flags`` itself raise.
+    """
+    try:
+        flags = getattr(sym, "flags", None)
+    except ValueError:
+        return False
+    bit = getattr(pyslang.ast.MethodFlags, name, None)
+    if flags is None or bit is None:
+        return False
+    try:
+        return bool(int(flags) & int(bit))
+    except Exception:
+        return name in _safe_flags(sym)
+
+
+#: Method qualifiers recovered from syntax.  ``extern`` is left out: it says
+#: where the body is, which is no part of the method's interface.
+_CST_METHOD_QUALIFIERS = ("local", "protected", "static", "pure", "virtual")
+
+
+def _cst_qualifiers(item: Any) -> list[str]:
+    # valueText, not str(): a token's str() carries its leading trivia, which
+    # for the first qualifier is the doc comment.
+    words = {getattr(q, "valueText", "") for q in (getattr(item, "qualifiers", None) or [])}
+    return [q for q in _CST_METHOD_QUALIFIERS if q in words]
+
+
+def _tokens_text(node: Any) -> str:
+    """A syntax node's source on one line, without comments: its tokens joined
+    with one space wherever the source had whitespace or a comment, except just
+    inside brackets and before a comma."""
+    tokens: list[Any] = []
+    collect = lambda n: tokens.append(n) if type(n).__name__ == "Token" else None  # noqa: E731
+    # Some syntax lists (a declarator's dimensions) come back as plain lists.
+    for part in node if isinstance(node, list) else [node]:
+        part.visit(collect)
+    out = ""
+    for tok in tokens:
+        text = tok.rawText
+        if out and tok.trivia and out[-1] not in "([{" and text not in (")", "]", "}", ","):
+            out += " "
+        out += text
+    return out
+
+
+def _cst_class_qualifier(syntax: Any) -> str | None:
+    """``virtual`` or ``interface``, from a class declaration's syntax."""
+    tok = getattr(syntax, "virtualOrInterface", None)
+    word = getattr(tok, "valueText", "") if tok is not None else ""
+    return word if word in ("virtual", "interface") else None
+
+
+def _is_linked(sm: Any, loc: Any) -> bool:
+    """Whether *loc* lies in text generated from a link database."""
+    try:
+        return sm is not None and sm.getFileName(loc).startswith("svdb-link:")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stream_key(sm: Any, loc: Any) -> tuple:
+    """Where *loc* falls in its compilation unit's preprocessed text: the root
+    buffer, then the offset at each level of `` `include `` down to *loc*
+    (after macro expansion).  No location sorts last."""
+    try:
+        loc = sm.getFullyExpandedLoc(loc)
+        offsets = []
+        while loc is not None and loc.buffer.id != 0:
+            offsets.append(loc.offset)
+            inc = sm.getIncludedFrom(loc.buffer)
+            if inc.buffer.id == 0:
+                return (0, loc.buffer.id, *reversed(offsets))
+            loc = sm.getFullyExpandedLoc(inc)
+    except Exception:  # noqa: BLE001 - a binding without these: no order
+        pass
+    return (1,)
+
+
+def _property_qualifiers(sym: Any) -> list[str]:
+    """``rand``/``randc``, ``static``, ``const`` and ``var`` of a class property,
+    in that order (visibility is added by the caller)."""
+    rand = str(getattr(sym, "randMode", ""))
+    quals = ["randc"] if rand == "RandMode.RandC" else ["rand"] if rand == "RandMode.Rand" else []
+    words: set[str] = set()
+    decl = getattr(getattr(sym, "syntax", None), "parent", None)
+    for node in (getattr(decl, "modifiers", None), getattr(getattr(decl, "parent", None), "qualifiers", None)):
+        for tok in node or ():
+            words.add(getattr(tok, "valueText", "") or str(tok).strip())
+    if "static" in words:
+        quals.append("static")
+    if "const" in words:
+        quals.append("const")
+    if "var" in words:
+        quals.append("var")
+    return quals
+
+
 def _visibility(sym: Any) -> str | None:
     vis = str(getattr(sym, "visibility", ""))
     if vis == "Visibility.Local":
@@ -763,7 +972,7 @@ def _subroutine_signature(sym: Any, is_task: bool) -> str:
     args = []
     for arg in getattr(sym, "arguments", []) or []:
         direction = _ARG_DIR.get(str(getattr(arg, "direction", "")), "")
-        atype, dims = _split_unpacked(str(getattr(arg, "type", "")) or "")
+        atype, dims = _written_type(arg) or _split_unpacked(str(getattr(arg, "type", "")) or "")
         piece = " ".join(p for p in (direction, atype, arg.name + dims) if p)
         default = _argument_default(arg)
         if default:
@@ -772,8 +981,58 @@ def _subroutine_signature(sym: Any, is_task: bool) -> str:
     arglist = ", ".join(args)
     if is_task:
         return f"task {sym.name}({arglist})"
-    ret = str(getattr(sym, "returnType", "")) or "void"
+    ret = _written_return_type(sym) or str(getattr(sym, "returnType", "")) or "void"
     return f"function {ret} {sym.name}({arglist})"
+
+
+def _written_type(sym: Any) -> tuple[str, str] | None:
+    """A variable's or argument's ``(type, unpacked dimensions)`` as written:
+    ``pair_t`` and ``[]`` rather than slang's resolved ``int$[][0:1]``.
+
+    ``None`` when there is no written type (an implicit one, or no syntax), so
+    the caller falls back to the resolved type.
+    """
+    declared = getattr(sym, "declaredType", None)
+    type_syntax = getattr(declared, "typeSyntax", None) if declared is not None else None
+    if type_syntax is None:
+        return None
+    # Packed dimensions bind to the type, as slang prints them: ``bit[7:0]``.
+    text = re.sub(r"\s+\[", "[", _tokens_text(type_syntax))
+    if not text:
+        return None
+    declarator = getattr(sym, "syntax", None)
+    dims = getattr(declarator, "dimensions", None) if declarator is not None else None
+    return text, (_tokens_text(dims) if dims is not None else "")
+
+
+def _written_return_type(sym: Any) -> str:
+    """A function's return type as written (``params_t``), or "" if unknown."""
+    syntax = getattr(sym, "syntax", None)
+    proto = getattr(syntax, "prototype", None) if syntax is not None else None
+    ret = getattr(proto, "returnType", None) if proto is not None else None
+    return _tokens_text(ret) if ret is not None else ""
+
+
+def _typedef_signature(sym: Any) -> str:
+    """``typedef <type> <name><dims>`` as written.  A struct, union or enum body
+    is abbreviated to ``{ ... }``: the members are not a one-line signature."""
+    syntax = getattr(sym, "syntax", None)
+    if syntax is None or "Typedef" not in type(syntax).__name__:
+        return f"typedef {sym.name}"
+    return _typedef_text(syntax)
+
+
+def _typedef_text(syntax: Any) -> str:
+    text = _tokens_text(syntax).rstrip(";").rstrip()
+    start = text.find("{")
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            if depth == 0:
+                text = text[:start] + "{ ... }" + text[i + 1:]
+                break
+    return text
 
 
 def _split_unpacked(type_str: str) -> tuple[str, str]:
@@ -840,7 +1099,14 @@ def _node_source(node: Any, sm: Any) -> str:
     try:
         start = node.getFirstToken().range.start
         end = node.getLastToken().range.end
+        if sm.isMacroLoc(start) or sm.isMacroLoc(end):
+            # Expanded from a macro: there is no source text to slice.
+            return _tokens_text(node)
         text = sm.getSourceText(start.buffer)
+        if not text.isascii():
+            # Offsets count bytes: a multi-byte character before *node* (a
+            # typographic apostrophe in a comment) would shift a str slice.
+            return _normalize_ws(text.encode("utf-8")[start.offset:end.offset].decode("utf-8", "replace"))
         return _normalize_ws(text[start.offset:end.offset])
     except Exception:
         return _normalize_ws(str(node))
